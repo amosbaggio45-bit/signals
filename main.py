@@ -2,11 +2,13 @@
 Bot Telegram per segnali di trading su XAUUSD.
 
 Strategia:
-  - MACD: EMA veloce 12, EMA lenta 26, signal = SMA a 9 periodi
-  - Trend filter: EMA20 vs EMA50
-  - LONG  -> MACD incrocia al rialzo la signal line  E  EMA20 > EMA50
-  - SHORT -> MACD incrocia al ribasso la signal line  E  EMA20 < EMA50
-  - TP/SL calcolati automaticamente in base all'ATR(14)
+  - Multi-Timeframe Trend Filter (H1): EMA20 vs EMA50 su H1 per confermare la direzione primaria.
+  - Volatility Filter (M15): ATR(14) >= MIN_ATR_THRESHOLD per evitare mercati laterali/piatti.
+  - MACD (M15): EMA veloce 12, EMA lenta 26, signal = SMA a 9 periodi
+  - Trend filter locale (M15): EMA20 vs EMA50
+  - LONG  -> MACD incrocia al rialzo la signal line E EMA20 > EMA50 (M15) E Trend H1 == BULLISH
+  - SHORT -> MACD incrocia al ribasso la signal line E EMA20 < EMA50 (M15) E Trend H1 == BEARISH
+  - TP/SL calcolati automaticamente in base all'ATR(14) su M15
 
 Pensato per girare periodicamente (es. ogni 15 minuti) via GitHub Actions,
 senza bisogno di un server sempre acceso.
@@ -24,8 +26,9 @@ import requests
 # ----------------------------------------------------------------------
 
 SYMBOL = "XAU/USD"
-TIMEFRAME = os.environ.get("TIMEFRAME", "15min")   # es: 5min, 15min, 1h
-OUTPUT_SIZE = 200                                  # candele storiche da scaricare
+TIMEFRAME = os.environ.get("TIMEFRAME", "15min")   # Timeframe di segnale (es: 15min)
+TIMEFRAME_H1 = "1h"                               # Timeframe per trend superiore
+OUTPUT_SIZE = 200                                  # Candele storiche da scaricare
 
 EMA_FAST = 12
 EMA_SLOW = 26
@@ -35,13 +38,14 @@ TREND_EMA_FAST = 20
 TREND_EMA_SLOW = 50
 
 ATR_PERIOD = 14
+MIN_ATR_THRESHOLD = 1.5  # SOGLIA ATR MINIMA: scarta i segnali se l'ATR su M15 e sotto questo valore (mercato piatto)
 SL_ATR_MULT = 1.5
-TP_ATR_MULT = 3.0        # risk/reward 1:2
+TP_ATR_MULT = 3.0        # Risk/reward 1:2
 
 # Finestra di anticipo per gli alert sulle notizie (minuti prima dell'evento)
 NEWS_LOOKAHEAD_MIN = 45
-NEWS_IMPACT_LEVELS = {"High"}          # eventi da notificare
-NEWS_CURRENCIES = {"USD"}              # valute rilevanti per l'oro
+NEWS_IMPACT_LEVELS = {"High"}          # Eventi da notificare
+NEWS_CURRENCIES = {"USD"}              # Valute rilevanti per l'oro
 
 STATE_FILE = "state.json"
 
@@ -84,11 +88,11 @@ def send_telegram(message: str):
 # DATI DI MERCATO E INDICATORI
 # ----------------------------------------------------------------------
 
-def fetch_candles() -> pd.DataFrame:
+def fetch_candles(interval: str = TIMEFRAME) -> pd.DataFrame:
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
-        "interval": TIMEFRAME,
+        "interval": interval,
         "outputsize": OUTPUT_SIZE,
         "apikey": TWELVEDATA_API_KEY,
         "order": "ASC",
@@ -98,7 +102,7 @@ def fetch_candles() -> pd.DataFrame:
     data = resp.json()
 
     if "values" not in data:
-        raise RuntimeError(f"Errore API Twelve Data: {data}")
+        raise RuntimeError(f"Errore API Twelve Data ({interval}): {data}")
 
     df = pd.DataFrame(data["values"])
     df["datetime"] = pd.to_datetime(df["datetime"])
@@ -109,6 +113,29 @@ def fetch_candles() -> pd.DataFrame:
     # Scarto l'ultima candela: potrebbe essere ancora in formazione
     df = df.iloc[:-1].reset_index(drop=True)
     return df
+
+
+def get_h1_trend() -> str:
+    """Scarica i dati H1 e determina il trend primario basandosi su EMA20 e EMA50."""
+    try:
+        df_h1 = fetch_candles(interval=TIMEFRAME_H1)
+        if len(df_h1) < TREND_EMA_SLOW:
+            return "NEUTRAL"
+
+        ema20_h1 = df_h1["close"].ewm(span=TREND_EMA_FAST, adjust=False).mean()
+        ema50_h1 = df_h1["close"].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
+
+        last_ema20 = ema20_h1.iloc[-1]
+        last_ema50 = ema50_h1.iloc[-1]
+
+        if last_ema20 > last_ema50:
+            return "BULLISH"
+        elif last_ema20 < last_ema50:
+            return "BEARISH"
+        return "NEUTRAL"
+    except Exception as e:
+        print(f"Avviso: Errore nel recupero trend H1 ({e}). Continuo senza filtro H1.")
+        return "NEUTRAL"
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -134,27 +161,36 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def detect_signal(df: pd.DataFrame):
-    """Guarda le ultime due candele chiuse per un incrocio MACD/signal."""
+def detect_signal(df: pd.DataFrame, trend_h1: str):
+    """Guarda le ultime due candele chiuse per un incrocio MACD/signal e applica i filtri."""
     if len(df) < max(EMA_SLOW, TREND_EMA_SLOW, ATR_PERIOD) + 2:
         return None
 
     prev, curr = df.iloc[-2], df.iloc[-1]
 
+    # --- FILTRO 1: Volatilità Minima (ATR) ---
+    atr = curr["atr"]
+    if pd.isna(atr) or atr < MIN_ATR_THRESHOLD:
+        # Volatilità insufficiente: mercato piatto
+        return None
+
+    # --- RILEVAMENTO INCROCIO MACD SU M15 ---
     crossed_up = prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
     crossed_down = prev["macd"] >= prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
 
+    # --- FILTRO 2 & 3: EMA20/50 locale (M15) E Trend Multi-Timeframe (H1) ---
+    direction = None
     if crossed_up and curr["ema20"] > curr["ema50"]:
-        direction = "LONG"
+        if trend_h1 in ("BULLISH", "NEUTRAL"):
+            direction = "LONG"
     elif crossed_down and curr["ema20"] < curr["ema50"]:
-        direction = "SHORT"
-    else:
+        if trend_h1 in ("BEARISH", "NEUTRAL"):
+            direction = "SHORT"
+
+    if not direction:
         return None
 
     entry = curr["close"]
-    atr = curr["atr"]
-    if pd.isna(atr):
-        return None
 
     if direction == "LONG":
         sl = entry - SL_ATR_MULT * atr
@@ -170,6 +206,7 @@ def detect_signal(df: pd.DataFrame):
         "sl": round(sl, 2),
         "tp": round(tp, 2),
         "atr": round(atr, 2),
+        "trend_h1": trend_h1,
     }
 
 
@@ -216,19 +253,26 @@ def main():
 
     # --- Segnale di trading ---
     try:
-        df = fetch_candles()
+        # 1. Recupero Trend H1
+        trend_h1 = get_h1_trend()
+        
+        # 2. Recupero Candele e Indicatori M15
+        df = fetch_candles(interval=TIMEFRAME)
         df = compute_indicators(df)
-        signal = detect_signal(df)
+        
+        # 3. Analisi Segnale con Filtro ATR + Multi-Timeframe H1
+        signal = detect_signal(df, trend_h1)
 
         if signal and signal["bar_time"] != state.get("last_signal_bar"):
             emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
             msg = (
                 f"{emoji} <b>Segnale {signal['direction']} XAUUSD</b>\n"
                 f"Timeframe: {TIMEFRAME}\n"
+                f"Trend H1: {signal['trend_h1']}\n"
                 f"Entry: {signal['entry']}\n"
                 f"SL: {signal['sl']}\n"
                 f"TP: {signal['tp']}\n"
-                f"ATR: {signal['atr']}\n"
+                f"ATR (M15): {signal['atr']}\n"
                 f"Candela: {signal['bar_time']}"
             )
             send_telegram(msg)
@@ -250,7 +294,7 @@ def main():
             )
             send_telegram(msg)
             already.add(ev["id"])
-        # tieni solo le ultime 200 per non far crescere il file all'infinito
+        # Tieni solo le ultime 200 per non far crescere il file all'infinito
         state["notified_news"] = list(already)[-200:]
     except Exception as e:
         send_telegram(f"⚠️ Errore nel modulo notizie: {e}")
