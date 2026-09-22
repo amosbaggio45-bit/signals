@@ -1,12 +1,9 @@
 name: XAUUSD Telegram Bot
 
 on:
+  workflow_dispatch:        # Mantiene la possibilità di avviarlo manualmente
   schedule:
-    - cron: "*/15 * * * *"   # ogni 15 minuti (orario UTC)
-  workflow_dispatch: {}       # permette anche l'avvio manuale da GitHub
-
-permissions:
-  contents: write
+    - cron: '*/15 * * * *'  # Esegue il workflow automaticamente ogni 15 minuti
 
 jobs:
   run-bot:
