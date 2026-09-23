@@ -2,13 +2,18 @@
 Bot Telegram per segnali di trading su XAUUSD.
 
 Strategia:
-  - Multi-Timeframe Trend Filter (H1): EMA20 vs EMA50 su H1 per confermare la direzione primaria.
-  - Volatility Filter (M15): ATR(14) >= MIN_ATR_THRESHOLD per evitare mercati laterali/piatti.
-  - MACD (M15): EMA veloce 12, EMA lenta 26, signal = SMA a 9 periodi
-  - Trend filter locale (M15): EMA20 vs EMA50
-  - LONG  -> MACD incrocia al rialzo la signal line E EMA20 > EMA50 (M15) E Trend H1 == BULLISH
-  - SHORT -> MACD incrocia al ribasso la signal line E EMA20 < EMA50 (M15) E Trend H1 == BEARISH
-  - TP/SL calcolati automaticamente in base all'ATR(14) su M15
+  - MACD: EMA veloce 12, EMA lenta 26, signal = SMA a 9 periodi (timeframe M15)
+  - Trend filter M15: EMA20 vs EMA50
+  - Conferma multi-timeframe: il trend su H1 (EMA20 vs EMA50) deve essere
+    coerente con la direzione del segnale
+  - Filtro di volatilità minima: l'ATR corrente deve essere almeno
+    MIN_ATR_RATIO volte la sua media mobile, altrimenti il mercato è
+    considerato troppo piatto e il segnale viene scartato
+  - LONG  -> MACD incrocia al rialzo la signal line, EMA20 > EMA50 su M15,
+             trend H1 rialzista, volatilità sufficiente
+  - SHORT -> MACD incrocia al ribasso la signal line, EMA20 < EMA50 su M15,
+             trend H1 ribassista, volatilità sufficiente
+  - TP/SL calcolati automaticamente in base all'ATR(14)
 
 Pensato per girare periodicamente (es. ogni 15 minuti) via GitHub Actions,
 senza bisogno di un server sempre acceso.
@@ -16,7 +21,7 @@ senza bisogno di un server sempre acceso.
 
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import pandas as pd
 import requests
@@ -26,9 +31,10 @@ import requests
 # ----------------------------------------------------------------------
 
 SYMBOL = "XAU/USD"
-TIMEFRAME = os.environ.get("TIMEFRAME", "15min")   # Timeframe di segnale (es: 15min)
-TIMEFRAME_H1 = "1h"                               # Timeframe per trend superiore
-OUTPUT_SIZE = 200                                  # Candele storiche da scaricare
+TIMEFRAME = os.environ.get("TIMEFRAME", "15min")   # timeframe del segnale
+TREND_TIMEFRAME = os.environ.get("TREND_TIMEFRAME", "1h")  # timeframe di conferma
+OUTPUT_SIZE = 200          # candele storiche da scaricare (timeframe segnale)
+TREND_OUTPUT_SIZE = 100    # candele storiche da scaricare (timeframe di conferma)
 
 EMA_FAST = 12
 EMA_SLOW = 26
@@ -38,14 +44,19 @@ TREND_EMA_FAST = 20
 TREND_EMA_SLOW = 50
 
 ATR_PERIOD = 14
-MIN_ATR_THRESHOLD = 1.5  # SOGLIA ATR MINIMA: scarta i segnali se l'ATR su M15 e sotto questo valore (mercato piatto)
 SL_ATR_MULT = 1.5
-TP_ATR_MULT = 3.0        # Risk/reward 1:2
+TP_ATR_MULT = 3.0        # risk/reward 1:2
+
+# Filtro di volatilità minima: l'ATR attuale deve valere almeno questa
+# frazione della sua media mobile su ATR_MA_PERIOD candele, altrimenti
+# il mercato è considerato troppo piatto e il segnale viene scartato.
+ATR_MA_PERIOD = 50
+MIN_ATR_RATIO = 0.8
 
 # Finestra di anticipo per gli alert sulle notizie (minuti prima dell'evento)
 NEWS_LOOKAHEAD_MIN = 45
-NEWS_IMPACT_LEVELS = {"High"}          # Eventi da notificare
-NEWS_CURRENCIES = {"USD"}              # Valute rilevanti per l'oro
+NEWS_IMPACT_LEVELS = {"High"}          # eventi da notificare
+NEWS_CURRENCIES = {"USD"}              # valute rilevanti per l'oro
 
 STATE_FILE = "state.json"
 
@@ -55,6 +66,54 @@ TWELVEDATA_API_KEY = os.environ["TWELVEDATA_API_KEY"]
 
 # Feed calendario economico gratuito (mirror comunitario stile ForexFactory)
 NEWS_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+
+# Pattern noti per stimare impatto/durata attesa sul mercato (USD/Gold).
+# La direzione reale dipende dal dato effettivo vs le attese: qui indichiamo
+# lo scenario "sopra attese" e "sotto attese", non una previsione certa.
+NEWS_IMPACT_PATTERNS = [
+    (["non-farm payroll", "nonfarm payroll", "nfp"],
+     "Dato occupazionale chiave. Sopra attese → USD si rafforza → oro tende a scendere. "
+     "Sotto attese → USD si indebolisce → oro tende a salire.",
+     "Picco di volatilità nei primi 15-30 minuti, effetti sul trend che possono proseguire per l'intera giornata."),
+    (["cpi", "consumer price index", "inflation rate"],
+     "Dato sull'inflazione. Sopra attese → si rafforzano le aspettative di tassi alti → USD forte → oro tende a scendere. "
+     "Sotto attese → effetto opposto, oro tende a salire.",
+     "Forte volatilità nei primi 15-30 minuti, possibili riprese di movimento nelle ore successive."),
+    (["pce price index", "core pce"],
+     "Indicatore di inflazione preferito dalla Fed. Stesso schema del CPI: sopra attese penalizza l'oro, sotto attese lo favorisce.",
+     "Volatilità concentrata nei primi 15-30 minuti."),
+    (["fomc", "federal funds rate", "interest rate decision", "fed interest rate"],
+     "Decisione sui tassi Fed. Tono/rialzo hawkish → USD forte → oro tende a scendere. "
+     "Tono/taglio dovish → USD debole → oro tende a salire.",
+     "Reazione immediata forte alla decisione, spesso seguita da una seconda ondata di volatilità durante la conferenza stampa (fino a 1-2 ore dopo)."),
+    (["fomc press conference", "powell speak", "fed chair"],
+     "Conferenza stampa/discorso del presidente Fed. Alta imprevedibilità, il mercato reagisce parola per parola.",
+     "Volatilità elevata e irregolare per tutta la durata dell'intervento, 30-90 minuti."),
+    (["unemployment claims", "jobless claims"],
+     "Dato settimanale sul mercato del lavoro USA, impatto minore ma può muovere il dollaro a breve termine.",
+     "Volatilità contenuta, di solito esaurita entro 15-20 minuti."),
+    (["gdp"],
+     "Dato sulla crescita economica. Sopra attese tende a sostenere USD (oro giù); sotto attese l'opposto.",
+     "Volatilità moderata nei primi 20-30 minuti."),
+    (["retail sales"],
+     "Consumi USA. Dato forte sostiene USD (oro giù), dato debole lo indebolisce (oro su).",
+     "Volatilità moderata, 15-30 minuti."),
+    (["ism manufacturing", "ism services", "pmi"],
+     "Indice di attività economica. Sopra attese sostiene USD (oro giù); sotto attese l'opposto.",
+     "Volatilità moderata, 15-30 minuti."),
+]
+
+
+def classify_news_impact(title: str):
+    t = (title or "").lower()
+    for keywords, impact_text, duration_text in NEWS_IMPACT_PATTERNS:
+        if any(k in t for k in keywords):
+            return impact_text, duration_text
+    return (
+        "Evento ad alto impatto per USD: la direzione dipende dal dato effettivo vs le attese "
+        "(migliore del previsto tende a rafforzare il USD e a far scendere l'oro, e viceversa).",
+        "Possibile volatilità nei primi 15-30 minuti dalla pubblicazione.",
+    )
 
 
 # ----------------------------------------------------------------------
@@ -79,21 +138,27 @@ def send_telegram(message: str):
         "chat_id": TELEGRAM_CHAT_ID,
         "text": message,
         "parse_mode": "HTML",
+        "disable_web_page_preview": True,
     }
     resp = requests.post(url, json=payload, timeout=15)
     resp.raise_for_status()
+
+
+def fmt_time(iso_str: str) -> str:
+    dt = datetime.fromisoformat(iso_str)
+    return dt.strftime("%d/%m %H:%M UTC")
 
 
 # ----------------------------------------------------------------------
 # DATI DI MERCATO E INDICATORI
 # ----------------------------------------------------------------------
 
-def fetch_candles(interval: str = TIMEFRAME) -> pd.DataFrame:
+def fetch_candles(interval: str, output_size: int) -> pd.DataFrame:
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": SYMBOL,
         "interval": interval,
-        "outputsize": OUTPUT_SIZE,
+        "outputsize": output_size,
         "apikey": TWELVEDATA_API_KEY,
         "order": "ASC",
     }
@@ -115,29 +180,6 @@ def fetch_candles(interval: str = TIMEFRAME) -> pd.DataFrame:
     return df
 
 
-def get_h1_trend() -> str:
-    """Scarica i dati H1 e determina il trend primario basandosi su EMA20 e EMA50."""
-    try:
-        df_h1 = fetch_candles(interval=TIMEFRAME_H1)
-        if len(df_h1) < TREND_EMA_SLOW:
-            return "NEUTRAL"
-
-        ema20_h1 = df_h1["close"].ewm(span=TREND_EMA_FAST, adjust=False).mean()
-        ema50_h1 = df_h1["close"].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
-
-        last_ema20 = ema20_h1.iloc[-1]
-        last_ema50 = ema50_h1.iloc[-1]
-
-        if last_ema20 > last_ema50:
-            return "BULLISH"
-        elif last_ema20 < last_ema50:
-            return "BEARISH"
-        return "NEUTRAL"
-    except Exception as e:
-        print(f"Avviso: Errore nel recupero trend H1 ({e}). Continuo senza filtro H1.")
-        return "NEUTRAL"
-
-
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
@@ -157,41 +199,61 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     df["atr"] = tr.rolling(ATR_PERIOD).mean()
+    df["atr_ma"] = df["atr"].rolling(ATR_MA_PERIOD).mean()
 
     return df
 
 
-def detect_signal(df: pd.DataFrame, trend_h1: str):
-    """Guarda le ultime due candele chiuse per un incrocio MACD/signal e applica i filtri."""
-    if len(df) < max(EMA_SLOW, TREND_EMA_SLOW, ATR_PERIOD) + 2:
+def get_trend_confirmation():
+    """Trend sul timeframe superiore (es. H1): 'up', 'down' oppure None."""
+    df = fetch_candles(TREND_TIMEFRAME, TREND_OUTPUT_SIZE)
+    if len(df) < TREND_EMA_SLOW + 2:
+        return None
+
+    df["ema20"] = df["close"].ewm(span=TREND_EMA_FAST, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=TREND_EMA_SLOW, adjust=False).mean()
+    curr = df.iloc[-1]
+
+    if curr["ema20"] > curr["ema50"]:
+        return "up"
+    if curr["ema20"] < curr["ema50"]:
+        return "down"
+    return None
+
+
+def detect_signal(df: pd.DataFrame, trend_confirmation):
+    """Guarda le ultime due candele chiuse per un incrocio MACD/signal,
+    applicando conferma multi-timeframe e filtro di volatilità minima."""
+    min_bars = max(EMA_SLOW, TREND_EMA_SLOW, ATR_PERIOD + ATR_MA_PERIOD) + 2
+    if len(df) < min_bars:
         return None
 
     prev, curr = df.iloc[-2], df.iloc[-1]
 
-    # --- FILTRO 1: Volatilità Minima (ATR) ---
-    atr = curr["atr"]
-    if pd.isna(atr) or atr < MIN_ATR_THRESHOLD:
-        # Volatilità insufficiente: mercato piatto
-        return None
-
-    # --- RILEVAMENTO INCROCIO MACD SU M15 ---
     crossed_up = prev["macd"] <= prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
     crossed_down = prev["macd"] >= prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
 
-    # --- FILTRO 2 & 3: EMA20/50 locale (M15) E Trend Multi-Timeframe (H1) ---
-    direction = None
     if crossed_up and curr["ema20"] > curr["ema50"]:
-        if trend_h1 in ("BULLISH", "NEUTRAL"):
-            direction = "LONG"
+        direction = "LONG"
     elif crossed_down and curr["ema20"] < curr["ema50"]:
-        if trend_h1 in ("BEARISH", "NEUTRAL"):
-            direction = "SHORT"
-
-    if not direction:
+        direction = "SHORT"
+    else:
         return None
 
-    entry = curr["close"]
+    # --- Filtro di volatilità minima ---
+    atr = curr["atr"]
+    atr_ma = curr["atr_ma"]
+    if pd.isna(atr) or pd.isna(atr_ma):
+        return None
+    if atr < MIN_ATR_RATIO * atr_ma:
+        return None  # mercato troppo piatto, segnale scartato
 
+    # --- Conferma multi-timeframe ---
+    needed_trend = "up" if direction == "LONG" else "down"
+    if trend_confirmation != needed_trend:
+        return None  # trend sul timeframe superiore non conferma
+
+    entry = curr["close"]
     if direction == "LONG":
         sl = entry - SL_ATR_MULT * atr
         tp = entry + TP_ATR_MULT * atr
@@ -206,8 +268,48 @@ def detect_signal(df: pd.DataFrame, trend_h1: str):
         "sl": round(sl, 2),
         "tp": round(tp, 2),
         "atr": round(atr, 2),
-        "trend_h1": trend_h1,
     }
+
+
+# ----------------------------------------------------------------------
+# MESSAGGI TELEGRAM
+# ----------------------------------------------------------------------
+
+def build_signal_message(signal) -> str:
+    is_long = signal["direction"] == "LONG"
+    emoji = "🟢" if is_long else "🔴"
+    arrow = "📈" if is_long else "📉"
+    rr = TP_ATR_MULT / SL_ATR_MULT
+
+    return (
+        f"{emoji} <b>SEGNALE {signal['direction']}  —  XAUUSD</b> {arrow}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱ <b>Timeframe:</b> {TIMEFRAME}  (trend {TREND_TIMEFRAME} confermato ✅)\n\n"
+        f"💰 <b>Entry:</b> <code>{signal['entry']}</code>\n"
+        f"🛑 <b>Stop Loss:</b> <code>{signal['sl']}</code>  (−{SL_ATR_MULT}×ATR)\n"
+        f"🎯 <b>Take Profit:</b> <code>{signal['tp']}</code>  (+{TP_ATR_MULT}×ATR)\n"
+        f"⚖️ <b>Risk/Reward:</b> 1:{rr:.1f}\n\n"
+        f"📊 <b>ATR attuale:</b> {signal['atr']}\n"
+        f"🕓 <b>Candela:</b> {fmt_time(signal['bar_time'])}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def build_news_message(ev) -> str:
+    impact_text, duration_text = classify_news_impact(ev["title"])
+    forecast = ev.get("forecast") or "n/d"
+    previous = ev.get("previous") or "n/d"
+
+    return (
+        f"📰 <b>NOTIZIA IN ARRIVO</b>  ⏳ tra {ev['minutes_to_event']} min\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗞 <b>{ev['title']}</b>\n"
+        f"🕒 {fmt_time(ev['time'])}\n"
+        f"📌 Previsione: <b>{forecast}</b>  |  Precedente: <b>{previous}</b>\n\n"
+        f"📈 <b>Possibile impatto:</b>\n{impact_text}\n\n"
+        f"⏱ <b>Durata attesa:</b>\n{duration_text}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
 
 
 # ----------------------------------------------------------------------
@@ -239,6 +341,8 @@ def fetch_upcoming_news():
                 "title": ev.get("title"),
                 "time": ev_time.isoformat(),
                 "minutes_to_event": round(minutes_to_event),
+                "forecast": ev.get("forecast"),
+                "previous": ev.get("previous"),
             })
 
     return upcoming
@@ -253,32 +357,17 @@ def main():
 
     # --- Segnale di trading ---
     try:
-        # 1. Recupero Trend H1
-        trend_h1 = get_h1_trend()
-        
-        # 2. Recupero Candele e Indicatori M15
-        df = fetch_candles(interval=TIMEFRAME)
+        trend_confirmation = get_trend_confirmation()
+
+        df = fetch_candles(TIMEFRAME, OUTPUT_SIZE)
         df = compute_indicators(df)
-        
-        # 3. Analisi Segnale con Filtro ATR + Multi-Timeframe H1
-        signal = detect_signal(df, trend_h1)
+        signal = detect_signal(df, trend_confirmation)
 
         if signal and signal["bar_time"] != state.get("last_signal_bar"):
-            emoji = "🟢" if signal["direction"] == "LONG" else "🔴"
-            msg = (
-                f"{emoji} <b>Segnale {signal['direction']} XAUUSD</b>\n"
-                f"Timeframe: {TIMEFRAME}\n"
-                f"Trend H1: {signal['trend_h1']}\n"
-                f"Entry: {signal['entry']}\n"
-                f"SL: {signal['sl']}\n"
-                f"TP: {signal['tp']}\n"
-                f"ATR (M15): {signal['atr']}\n"
-                f"Candela: {signal['bar_time']}"
-            )
-            send_telegram(msg)
+            send_telegram(build_signal_message(signal))
             state["last_signal_bar"] = signal["bar_time"]
     except Exception as e:
-        send_telegram(f"⚠️ Errore nel modulo segnali: {e}")
+        send_telegram(f"⚠️ <b>Errore nel modulo segnali</b>\n{e}")
 
     # --- Notizie ---
     try:
@@ -287,17 +376,12 @@ def main():
         for ev in upcoming:
             if ev["id"] in already:
                 continue
-            msg = (
-                f"📰 <b>Notizia in arrivo ({ev['minutes_to_event']} min)</b>\n"
-                f"{ev['title']}\n"
-                f"Orario: {ev['time']}"
-            )
-            send_telegram(msg)
+            send_telegram(build_news_message(ev))
             already.add(ev["id"])
-        # Tieni solo le ultime 200 per non far crescere il file all'infinito
+        # tieni solo le ultime 200 per non far crescere il file all'infinito
         state["notified_news"] = list(already)[-200:]
     except Exception as e:
-        send_telegram(f"⚠️ Errore nel modulo notizie: {e}")
+        send_telegram(f"⚠️ <b>Errore nel modulo notizie</b>\n{e}")
 
     save_state(state)
 
