@@ -1,20 +1,20 @@
 {
   "last_signal_bar": "2026-10-23T00:45:00",
   "notified_news": [
-    "Final GDP q/q_2026-09-30T08:30:00-04:00",
-    "CPI m/m_2026-10-14T08:30:00-04:00",
-    "Average Hourly Earnings m/m_2026-10-02T08:30:00-04:00",
-    "CPI y/y_2026-10-14T08:30:00-04:00",
-    "Core CPI y/y_2026-10-14T08:30:00-04:00",
-    "Core PPI m/m_2026-10-15T08:30:00-04:00",
-    "Core CPI m/m_2026-10-14T08:30:00-04:00",
-    "Retail Sales m/m_2026-10-15T08:30:00-04:00",
     "Fed Chairman Warsh Speaks_2026-10-15T23:30:00-04:00",
+    "CPI y/y_2026-10-14T08:30:00-04:00",
     "Unemployment Rate_2026-10-02T08:30:00-04:00",
     "Core Retail Sales m/m_2026-10-15T08:30:00-04:00",
-    "PPI m/m_2026-10-15T08:30:00-04:00",
-    "Non-Farm Employment Change_2026-10-02T08:30:00-04:00",
+    "CPI m/m_2026-10-14T08:30:00-04:00",
     "Core PCE Price Index m/m_2026-09-30T08:30:00-04:00",
-    "FOMC Meeting Minutes_2026-10-07T14:00:00-04:00"
+    "Core PPI m/m_2026-10-15T08:30:00-04:00",
+    "Core CPI y/y_2026-10-14T08:30:00-04:00",
+    "PPI m/m_2026-10-15T08:30:00-04:00",
+    "Final GDP q/q_2026-09-30T08:30:00-04:00",
+    "Retail Sales m/m_2026-10-15T08:30:00-04:00",
+    "FOMC Meeting Minutes_2026-10-07T14:00:00-04:00",
+    "Core CPI m/m_2026-10-14T08:30:00-04:00",
+    "Non-Farm Employment Change_2026-10-02T08:30:00-04:00",
+    "Average Hourly Earnings m/m_2026-10-02T08:30:00-04:00"
   ]
 }
